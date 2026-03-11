@@ -8,6 +8,7 @@
         "open-telemetry/opentelemetry-auto-symfony": "^1.0",
         "open-telemetry/sdk": "^1.0",
         "symfony/framework-bundle": "^7.2",
+        "symfony/string": "^7.2",
         "symfony/yaml": "^7.2"
     },
     "autoload": {

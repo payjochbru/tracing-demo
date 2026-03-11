@@ -15,6 +15,7 @@ spec:
       containers:
         - name: gateway
           image: tracing-demo-gateway
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:

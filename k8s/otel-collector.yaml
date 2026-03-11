@@ -47,10 +47,11 @@ spec:
       containers:
         - name: otel-collector
           image: otel/opentelemetry-collector-contrib:0.98.0
+          imagePullPolicy: Always
           args: ["--config=/etc/otelcol/config.yaml"]
           env:
             - name: TEMPO_ENDPOINT
-              value: "tempo:4317"
+              value: "grafana-tempo-distributor.grafana-tempo.svc.cluster.local:4317"
           ports:
             - containerPort: 4317
               name: otlp-grpc

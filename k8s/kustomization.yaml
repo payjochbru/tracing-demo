@@ -14,17 +14,17 @@ resources:
 
 images:
   - name: tracing-demo-gateway
-    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-gateway
+    newName: ghcr.io/payjochbru/tracing-demo-gateway
     newTag: latest
   - name: tracing-demo-order
-    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-order
+    newName: ghcr.io/payjochbru/tracing-demo-order
     newTag: latest
   - name: tracing-demo-payment
-    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-payment
+    newName: ghcr.io/payjochbru/tracing-demo-payment
     newTag: latest
   - name: tracing-demo-notification
-    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-notification
+    newName: ghcr.io/payjochbru/tracing-demo-notification
     newTag: latest
   - name: tracing-demo-traffic-generator
-    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-traffic-generator
+    newName: ghcr.io/payjochbru/tracing-demo-traffic-generator
     newTag: latest

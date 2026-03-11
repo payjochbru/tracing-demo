@@ -15,6 +15,7 @@ spec:
       containers:
         - name: traffic-generator
           image: tracing-demo-traffic-generator
+          imagePullPolicy: Always
           env:
             - name: GATEWAY_URL
               value: http://gateway:8080

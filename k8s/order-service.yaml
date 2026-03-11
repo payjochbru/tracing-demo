@@ -15,6 +15,7 @@ spec:
       containers:
         - name: order-service
           image: tracing-demo-order
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:

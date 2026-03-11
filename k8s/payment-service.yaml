@@ -15,6 +15,7 @@ spec:
       containers:
         - name: payment-service
           image: tracing-demo-payment
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
