@@ -25,6 +25,8 @@ spec:
               value: http://otel-collector:4318
             - name: NOTIFICATION_SERVICE_URL
               value: http://notification-service:8080
+            - name: HTTPBIN_URL
+              value: https://httpbin.org
           readinessProbe:
             httpGet:
               path: /health

@@ -54,6 +54,63 @@ class PaymentController extends AbstractController
         $psp = self::PSP_ROUTING[$method] ?? 'stripe';
         $cardLast4 = (string) random_int(1000, 9999);
 
+        // External compliance / sanctions check
+        $httpbinUrl = rtrim($_SERVER['HTTPBIN_URL'] ?? 'https://httpbin.org', '/');
+        $complianceSpan = $tracer->spanBuilder('payment.compliance_check')
+            ->setSpanKind(SpanKind::KIND_CLIENT)
+            ->startSpan();
+        $complianceScope = $complianceSpan->activate();
+        try {
+            $complianceSpan->setAttribute('compliance.provider', 'external-sanctions-api');
+            $complianceSpan->setAttribute('compliance.customer_id', $customerId);
+            $complianceSpan->setAttribute('compliance.region', $region);
+
+            $complianceResponse = $this->httpClient->request('GET', $httpbinUrl . '/get', [
+                'query' => [
+                    'customer_id' => $customerId,
+                    'check_type' => 'sanctions,pep,adverse_media',
+                    'region' => $region,
+                ],
+                'timeout' => 5,
+            ]);
+            $complianceSpan->setAttribute('http.response.status_code', $complianceResponse->getStatusCode());
+            $complianceSpan->setAttribute('compliance.result', 'clear');
+            $complianceSpan->addEvent('compliance.check_passed', [
+                'lists_checked' => 'OFAC,EU_SANCTIONS,UN_SANCTIONS',
+                'matches_found' => 0,
+            ]);
+        } catch (\Throwable $e) {
+            $complianceSpan->setStatus(StatusCode::STATUS_ERROR, 'Compliance check failed');
+            $complianceSpan->recordException($e);
+        } finally {
+            $complianceScope->detach();
+            $complianceSpan->end();
+        }
+
+        // Exchange rate lookup (for multi-currency display)
+        $fxSpan = $tracer->spanBuilder('payment.fx_rate_lookup')
+            ->setSpanKind(SpanKind::KIND_CLIENT)
+            ->startSpan();
+        $fxScope = $fxSpan->activate();
+        try {
+            $fxSpan->setAttribute('fx.base_currency', $currency);
+            $fxSpan->setAttribute('fx.provider', 'external-fx-api');
+            $fxResponse = $this->httpClient->request('GET', $httpbinUrl . '/get', [
+                'query' => ['base' => $currency, 'symbols' => 'USD,GBP'],
+                'timeout' => 5,
+            ]);
+            $fxSpan->setAttribute('http.response.status_code', $fxResponse->getStatusCode());
+            $fxSpan->setAttribute('fx.rate_eur_usd', 1.0847);
+            $fxSpan->setAttribute('fx.rate_eur_gbp', 0.8612);
+            $fxSpan->addEvent('fx.rates_fetched');
+        } catch (\Throwable $e) {
+            $fxSpan->setStatus(StatusCode::STATUS_ERROR, 'FX rate lookup failed');
+            $fxSpan->recordException($e);
+        } finally {
+            $fxScope->detach();
+            $fxSpan->end();
+        }
+
         // Fraud check
         $fraudSpan = $tracer->spanBuilder('payment.fraud_check')->startSpan();
         $fraudScope = $fraudSpan->activate();

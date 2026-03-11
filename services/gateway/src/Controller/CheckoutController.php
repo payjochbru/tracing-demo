@@ -104,6 +104,33 @@ class CheckoutController extends AbstractController
             $validateSpan->end();
         }
 
+        // Geo-IP / customer location verification (external API)
+        $httpbinUrl = rtrim($_SERVER['HTTPBIN_URL'] ?? 'https://httpbin.org', '/');
+        $geoSpan = $tracer->spanBuilder('gateway.geo_ip_lookup')
+            ->setSpanKind(SpanKind::KIND_CLIENT)
+            ->startSpan();
+        $geoScope = $geoSpan->activate();
+        try {
+            $geoSpan->setAttribute('customer.id', $customerId);
+            $geoSpan->setAttribute('geo.provider', 'external-geo-api');
+            $geoResponse = $this->httpClient->request('GET', $httpbinUrl . '/get', [
+                'query' => ['customer_id' => $customerId, 'ip' => '203.0.113.' . random_int(1, 254)],
+                'timeout' => 5,
+            ]);
+            $geoSpan->setAttribute('http.response.status_code', $geoResponse->getStatusCode());
+            $geoSpan->setAttribute('geo.country', $region === 'eu-west' ? 'NL' : 'DE');
+            $geoSpan->addEvent('geo.location_resolved', [
+                'country' => $region === 'eu-west' ? 'NL' : 'DE',
+                'region' => $region,
+            ]);
+        } catch (\Throwable $e) {
+            $geoSpan->setStatus(StatusCode::STATUS_ERROR, 'Geo-IP lookup failed');
+            $geoSpan->recordException($e);
+        } finally {
+            $geoScope->detach();
+            $geoSpan->end();
+        }
+
         // Idempotency check
         $idempotencySpan = $tracer->spanBuilder('gateway.idempotency_check')->startSpan();
         $idempotencyScope = $idempotencySpan->activate();

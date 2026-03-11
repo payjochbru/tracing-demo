@@ -147,6 +147,46 @@ class OrderController extends AbstractController
             $inventorySpan->end();
         }
 
+        // Calculate shipping cost via external API
+        $httpbinUrl = rtrim($_SERVER['HTTPBIN_URL'] ?? 'https://httpbin.org', '/');
+        $shippingSpan = $tracer->spanBuilder('shipping.calculate_cost')
+            ->setSpanKind(SpanKind::KIND_CLIENT)
+            ->startSpan();
+        $shippingScope = $shippingSpan->activate();
+        try {
+            $totalWeight = array_sum(array_map(fn($i) => ($i['weight_kg'] ?? 0.5) * ($i['quantity'] ?? 1), $items));
+            $shippingSpan->setAttribute('shipping.region', $region);
+            $shippingSpan->setAttribute('shipping.total_weight_kg', round($totalWeight, 2));
+            $shippingSpan->setAttribute('shipping.priority', $priority);
+            $shippingSpan->setAttribute('shipping.provider', 'external-shipping-api');
+
+            $shippingResponse = $this->httpClient->request('POST', $httpbinUrl . '/post', [
+                'json' => [
+                    'region' => $region,
+                    'weight_kg' => $totalWeight,
+                    'priority' => $priority,
+                ],
+                'timeout' => 5,
+            ]);
+            $shippingSpan->setAttribute('http.response.status_code', $shippingResponse->getStatusCode());
+
+            $shippingCost = $priority === 'express'
+                ? round($totalWeight * 8.50, 2)
+                : round($totalWeight * 4.95, 2);
+            $shippingSpan->setAttribute('shipping.cost', $shippingCost);
+            $shippingSpan->setAttribute('shipping.currency', 'EUR');
+            $shippingSpan->addEvent('shipping.cost_calculated', [
+                'cost' => $shippingCost,
+                'method' => $priority === 'express' ? 'next_day' : 'standard_3_5_days',
+            ]);
+        } catch (\Throwable $e) {
+            $shippingSpan->setStatus(StatusCode::STATUS_ERROR, 'Shipping calculation failed');
+            $shippingSpan->recordException($e);
+        } finally {
+            $shippingScope->detach();
+            $shippingSpan->end();
+        }
+
         // Process payment
         $paymentUrl = rtrim($_SERVER['PAYMENT_SERVICE_URL'] ?? 'http://payment-service:8080', '/');
         $paymentResponse = $this->httpClient->request('POST', $paymentUrl . '/payments', [
