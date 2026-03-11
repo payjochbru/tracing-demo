@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: traffic-generator
-  namespace: tracing-demo
 spec:
   replicas: 1
   selector:
@@ -15,7 +14,7 @@ spec:
     spec:
       containers:
         - name: traffic-generator
-          image: ghcr.io/OWNER/tracing-demo-traffic-generator:latest  # Replace OWNER with your GitHub username/org
+          image: tracing-demo-traffic-generator
           env:
             - name: GATEWAY_URL
               value: http://gateway:8080

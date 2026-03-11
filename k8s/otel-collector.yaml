@@ -2,7 +2,6 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: otel-collector-config
-  namespace: tracing-demo
 data:
   config.yaml: |
     receivers:
@@ -35,7 +34,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: otel-collector
-  namespace: tracing-demo
 spec:
   replicas: 1
   selector:
@@ -52,7 +50,7 @@ spec:
           args: ["--config=/etc/otelcol/config.yaml"]
           env:
             - name: TEMPO_ENDPOINT
-              value: "tempo:4317"  # Change this to your Tempo gRPC endpoint
+              value: "tempo:4317"
           ports:
             - containerPort: 4317
               name: otlp-grpc
@@ -77,7 +75,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: otel-collector
-  namespace: tracing-demo
 spec:
   selector:
     app: otel-collector

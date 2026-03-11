@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tracing-demo
+
+resources:
+  - namespace.yaml
+  - otel-collector.yaml
+  - gateway.yaml
+  - order-service.yaml
+  - payment-service.yaml
+  - notification-service.yaml
+  - traffic-generator.yaml
+
+images:
+  - name: tracing-demo-gateway
+    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-gateway
+    newTag: latest
+  - name: tracing-demo-order
+    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-order
+    newTag: latest
+  - name: tracing-demo-payment
+    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-payment
+    newTag: latest
+  - name: tracing-demo-notification
+    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-notification
+    newTag: latest
+  - name: tracing-demo-traffic-generator
+    newName: ghcr.io/payjochbru/tracing-demo/tracing-demo-traffic-generator
+    newTag: latest
