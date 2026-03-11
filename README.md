@@ -17,19 +17,129 @@ All services ──► OTel Collector ──► Grafana Tempo
 |---|---|
 | **Gateway** | Entry point. Validates checkout requests, forwards to Order Service. |
 | **Order Service** | Creates orders, checks inventory, calls Payment and Notification services. |
-| **Payment Service** | Fraud check, authorization, settlement. ~5% simulated failure rate. |
+| **Payment Service** | Fraud check, authorization, settlement. Simulated failure scenarios. |
 | **Notification Service** | Simulates email/SMS delivery. Leaf node in the trace tree. |
 | **Traffic Generator** | Continuously sends randomized checkout requests to the Gateway. |
 
-## What you'll see in Tempo
+## Reading a Trace -- A Walkthrough
 
-Each checkout request produces a distributed trace spanning all four services, including:
+Open a trace in Grafana Tempo and follow the waterfall from top to bottom. Each horizontal bar is a **span** -- a single unit of work. Together they form a **trace** that shows the full lifecycle of a request across all services.
 
-- **Auto-instrumented spans** from `opentelemetry-auto-symfony` (HTTP server/client)
-- **Custom business spans**: `checkout.validate_input`, `order.create`, `inventory.check`, `payment.fraud_check`, `payment.authorize`, `payment.settle`, `notification.prepare`, `notification.deliver`
-- **Rich attributes**: customer IDs, order IDs, payment methods, amounts, risk scores, card last4 digits
-- **Span events**: `input.validated`, `order.received`, `inventory.reserved`, `fraud_check.completed`, `authorization.approved`, `settlement.completed`, etc.
-- **Error traces** on ~5% of payments showing declined status
+### 1. Gateway receives the request
+
+The top-level span is created automatically by OpenTelemetry's Symfony auto-instrumentation. It captures the incoming `POST /checkout` request.
+
+| Span | What it shows |
+|---|---|
+| `checkout.validate_input` | Manual span. Validates the cart contents. Look at its **attributes** panel to see `customer.id`, `cart.total`, `cart.items_count`, and `cart.currency`. |
+| `gateway.geo_ip_lookup` | External HTTP call to a geo-IP API (httpbin.org). This is a real network call -- the span duration reflects actual internet latency, not a simulation. |
+| `gateway.idempotency_check` | Checks whether this request was already processed. Shows `idempotency.key` in attributes. |
+
+After validation, the gateway makes an HTTP call to the order service. The auto-instrumentation creates a **client span** (`POST`) and injects a `traceparent` header into the outgoing request. This is how the trace crosses the service boundary.
+
+### 2. Order Service processes the order
+
+The order service picks up the `traceparent` header and continues the same trace. All spans below are children of the gateway's outgoing HTTP call.
+
+| Span | What it shows |
+|---|---|
+| `db.query INSERT orders` | Simulated database call. Check the **attributes** for `db.system` (postgresql), `db.statement` (the SQL), and `db.operation` (INSERT). These follow [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/database/). Occasionally (~5%) this is a **slow query** -- you'll see a `db.slow_query` event with the duration. |
+| `inventory.check` | Parent span for the full inventory check. |
+| `inventory.check_sku` | One child span per item. Look at the `cache.hit` attribute (true/false). On a cache miss, you'll see a nested `db.query SELECT stock` span -- showing the extra database round-trip. ~8% chance of **out-of-stock** errors on certain SKUs, visible as a red error span with a recorded exception. |
+| `shipping.calculate_cost` | External HTTP call to a shipping cost API (httpbin.org). Attributes show `shipping.total_weight_kg`, `shipping.cost`, and `shipping.priority`. Express orders cost more. |
+
+### 3. Payment Service handles the payment
+
+The order service calls the payment service, again propagating the trace context.
+
+| Span | What it shows |
+|---|---|
+| `payment.compliance_check` | External HTTP call to a sanctions/PEP screening API (httpbin.org). Attributes: `compliance.provider`, `compliance.result`. Events show which sanctions lists were checked. |
+| `payment.fx_rate_lookup` | External HTTP call for exchange rates (httpbin.org). Attributes show `fx.base_currency` and rate values. |
+| `payment.fraud_check` | Risk scoring. The `fraud.risk_score` attribute shows the calculated score. High scores (>60) trigger an `fraud.additional_checks_triggered` event. Scores above 90 result in a hard block -- look for a red error span with a `recordException` showing the reason. |
+| `payment.3ds_verification` | Only appears for card payments (Visa/Mastercard) over EUR 250. Simulates 3D Secure authentication. ~2% timeout errors. |
+| `psp.authorize (pay.nl)` | The actual payment authorization call to the PSP. The PSP name varies by payment method (pay.nl, mollie, or adyen). Attributes include `payment.method`, `payment.amount`, `payment.card_last4`, and `psp.name`. On decline, you'll see `payment.decline_code` with reasons like `insufficient_funds`, `card_expired`, or `suspected_fraud`. |
+| `payment.settle` | Final settlement after successful authorization. |
+| `db.query INSERT payments` | Persists the payment record. |
+
+### 4. Notification Service delivers the message
+
+Called by both the order service (confirmation) and the payment service (failure alerts, fraud alerts).
+
+| Span | What it shows |
+|---|---|
+| `notification.render_template` | Template rendering. The `template.name` attribute shows which template (e.g. `emails/order_confirmed.html.twig`). Events show render time and output size. |
+| `db.query INSERT notifications` | Persists the notification record. |
+| `notification.deliver (sendgrid)` | Delivery attempt via the primary provider. The provider name is in the span name. ~8% chance of failure -- look for red error spans with `recordException` showing connection errors or timeouts. |
+| `notification.deliver (ses)` | Only appears when the primary provider failed. This is the **fallback** -- look at the `notification.is_retry` and `notification.retry_reason` attributes. ~2% chance this also fails, resulting in a full delivery failure (502). |
+
+## Key OpenTelemetry Concepts Demonstrated
+
+### Spans and Traces
+
+A **trace** is the full journey of a request. It is made up of **spans** -- each span represents one operation (an HTTP request, a database query, a business logic step). Spans have a parent-child relationship that creates the waterfall view.
+
+### Context Propagation
+
+When one service calls another over HTTP, the `traceparent` header carries the trace ID and parent span ID. The receiving service uses this to attach its spans to the same trace. This is how a single trace can span four separate Kubernetes pods.
+
+### Auto-Instrumentation vs Manual Instrumentation
+
+- **Auto-instrumented spans** are created automatically by `opentelemetry-auto-symfony`. These are the `POST` and `GET` spans for HTTP calls. They require zero code changes.
+- **Manual spans** are created explicitly in the controller code using `$tracer->spanBuilder('name')->startSpan()`. These carry business meaning like `payment.fraud_check` or `inventory.check`.
+
+Both types appear in the same trace, side by side.
+
+### Span Attributes
+
+Key-value pairs attached to a span. Click any span in Tempo to see its attributes. Examples:
+
+- `db.system=postgresql`, `db.statement=INSERT INTO orders ...` -- database details
+- `payment.method=ideal`, `psp.name=mollie` -- payment context
+- `fraud.risk_score=73`, `compliance.result=clear` -- business data
+- `cache.hit=true` -- infrastructure data
+
+### Span Events
+
+Timestamped log entries within a span. They mark specific moments, like `fraud_check.passed`, `authorization.approved`, or `db.slow_query`. Look for the "Events" section when you click a span in Tempo.
+
+### Span Status and Errors
+
+Spans can have a status of OK or ERROR. Error spans appear in red in the waterfall. When an error occurs, `recordException` captures the exception class, message, and stack trace directly on the span. In this demo, errors include:
+
+- **Rate limiting** (gateway, 429) -- `Rate limit exceeded for customer ...`
+- **Empty cart** (gateway, 400) -- `Cannot checkout with an empty cart`
+- **Out of stock** (order service, 409) -- `Insufficient stock for SKU MK-300`
+- **Fraud block** (payment, 403) -- `Transaction blocked: risk score 94 exceeds threshold 90`
+- **3DS timeout** (payment, 504) -- `3D Secure verification timed out after 30s`
+- **PSP timeout** (payment, 504) -- `Connection to pay.nl-api.example.com timed out`
+- **Payment declined** (payment, 422) -- various decline codes
+- **Provider failure** (notification, 502) -- `Fallback provider ses also failed`
+
+### Span Kind
+
+Some spans have a **kind** that describes their role:
+
+- `SERVER` -- handling an incoming request (auto-instrumented)
+- `CLIENT` -- making an outgoing call (database queries, external APIs)
+- `INTERNAL` -- internal processing (default for manual spans)
+
+### External API Calls
+
+Three services make real HTTP calls to httpbin.org, simulating third-party API integrations. These show actual network latency in the trace and demonstrate that context propagation works even to external services. The spans for these calls are visible as `httpbin.org GET` or `httpbin.org POST` in the waterfall.
+
+## Error Scenarios in the Traffic
+
+The traffic generator sends a mix of request types to produce varied traces:
+
+| Scenario | Weight | What to look for |
+|---|---|---|
+| Normal checkout | 60% | Happy path through all four services |
+| High-value checkout | 10% | Large orders that trigger `checkout.high_value_order` events and 3DS verification |
+| Express checkout | 10% | `order.priority=express`, triggers both email and SMS notifications |
+| Order lookup | 15% | `GET /orders/{id}` -- shorter traces with just gateway + order service, ~10% return 404 |
+| Empty cart | 5% | Validation error at the gateway -- very short trace with error span |
+| Burst traffic | 20% | 1-2 rapid follow-up requests after the main one |
 
 ## Prerequisites
 
