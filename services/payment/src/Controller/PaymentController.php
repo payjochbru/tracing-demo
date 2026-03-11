@@ -16,12 +16,12 @@ class PaymentController extends AbstractController
     private const PAYMENT_METHODS = ['visa', 'mastercard', 'ideal', 'bancontact', 'sepa_direct_debit', 'apple_pay'];
 
     private const PSP_ROUTING = [
-        'visa' => 'stripe',
-        'mastercard' => 'stripe',
+        'visa' => 'pay.nl',
+        'mastercard' => 'pay.nl',
         'ideal' => 'mollie',
         'bancontact' => 'mollie',
         'sepa_direct_debit' => 'adyen',
-        'apple_pay' => 'stripe',
+        'apple_pay' => 'pay.nl',
     ];
 
     private const DECLINE_REASONS = [
@@ -51,7 +51,7 @@ class PaymentController extends AbstractController
         $requestId = $data['request_id'] ?? 'unknown';
         $region = $data['region'] ?? 'eu-west';
         $method = self::PAYMENT_METHODS[array_rand(self::PAYMENT_METHODS)];
-        $psp = self::PSP_ROUTING[$method] ?? 'stripe';
+        $psp = self::PSP_ROUTING[$method] ?? 'pay.nl';
         $cardLast4 = (string) random_int(1000, 9999);
 
         // External compliance / sanctions check
@@ -225,7 +225,7 @@ class PaymentController extends AbstractController
 
             // PSP response times vary by provider
             $pspLatency = match ($psp) {
-                'stripe' => random_int(20000, 60000),
+                'pay.nl' => random_int(20000, 60000),
                 'mollie' => random_int(30000, 90000),
                 'adyen' => random_int(25000, 70000),
                 default => random_int(30000, 80000),
