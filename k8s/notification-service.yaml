@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: tracing-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+    spec:
+      containers:
+        - name: notification-service
+          image: ghcr.io/OWNER/tracing-demo-notification:latest  # Replace OWNER with your GitHub username/org
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: notification-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4318
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: tracing-demo
+spec:
+  selector:
+    app: notification-service
+  ports:
+    - port: 8080
+      targetPort: 8080

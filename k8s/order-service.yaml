@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: tracing-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+        - name: order-service
+          image: ghcr.io/OWNER/tracing-demo-order:latest  # Replace OWNER with your GitHub username/org
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: order-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4318
+            - name: PAYMENT_SERVICE_URL
+              value: http://payment-service:8080
+            - name: NOTIFICATION_SERVICE_URL
+              value: http://notification-service:8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: tracing-demo
+spec:
+  selector:
+    app: order-service
+  ports:
+    - port: 8080
+      targetPort: 8080

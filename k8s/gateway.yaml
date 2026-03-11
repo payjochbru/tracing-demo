@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: tracing-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/OWNER/tracing-demo-gateway:latest  # Replace OWNER with your GitHub username/org
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: gateway
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4318
+            - name: ORDER_SERVICE_URL
+              value: http://order-service:8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: tracing-demo
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
