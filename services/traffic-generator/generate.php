@@ -86,12 +86,12 @@ while (true) {
             break;
     }
 
-    // Occasional burst: 20% chance of sending 2-3 rapid requests
-    if (random_int(1, 100) <= 20) {
-        $burstCount = random_int(1, 2);
+    // Occasional burst: 40% chance of sending 3-8 rapid requests
+    if (random_int(1, 100) <= 40) {
+        $burstCount = random_int(3, 8);
         echo "[{$timestamp}] burst +{$burstCount} rapid requests\n";
         for ($b = 0; $b < $burstCount; $b++) {
-            usleep(random_int(100000, 300000));
+            usleep(random_int(20000, 80000));
             $burstCustomer = $customers[array_rand($customers)];
             $response = doPost("{$gatewayUrl}/checkout", ['customer_id' => $burstCustomer]);
             echo "[{$timestamp}]   burst | HTTP {$response['code']} | {$burstCustomer}\n";
