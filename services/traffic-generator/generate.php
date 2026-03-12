@@ -1,7 +1,7 @@
 <?php
 
 $gatewayUrl = $_SERVER['GATEWAY_URL'] ?? 'http://gateway:8080';
-$intervalMs = (int) ($_SERVER['REQUEST_INTERVAL_MS'] ?? 3000);
+$intervalMs = (int) ($_SERVER['REQUEST_INTERVAL_MS'] ?? 300);
 $customers = ['cust_alice', 'cust_bob', 'cust_charlie', 'cust_diana', 'cust_eve', 'cust_frank'];
 
 $scenarios = [
