@@ -12,6 +12,18 @@ data:
           http:
             endpoint: 0.0.0.0:4318
 
+    connectors:
+      spanmetrics:
+        histogram:
+          explicit:
+            buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+        dimensions:
+          - name: http.method
+          - name: http.status_code
+          - name: service.name
+        exemplars:
+          enabled: true
+
     processors:
       batch:
         timeout: 1s
@@ -23,12 +35,20 @@ data:
         tls:
           insecure: true
 
+      prometheus:
+        endpoint: 0.0.0.0:9090
+        resource_to_telemetry_conversion:
+          enabled: true
+
     service:
       pipelines:
         traces:
           receivers: [otlp]
           processors: [batch]
-          exporters: [otlp/tempo]
+          exporters: [otlp/tempo, spanmetrics]
+        metrics:
+          receivers: [spanmetrics]
+          exporters: [prometheus]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -43,6 +63,10 @@ spec:
     metadata:
       labels:
         app: otel-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: otel-collector
@@ -57,6 +81,8 @@ spec:
               name: otlp-grpc
             - containerPort: 4318
               name: otlp-http
+            - containerPort: 9090
+              name: prometheus
           volumeMounts:
             - name: config
               mountPath: /etc/otelcol
@@ -86,3 +112,6 @@ spec:
     - name: otlp-http
       port: 4318
       targetPort: 4318
+    - name: prometheus
+      port: 9090
+      targetPort: 9090

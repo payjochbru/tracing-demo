@@ -5,6 +5,8 @@ namespace App\Controller;
 use OpenTelemetry\API\Globals;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
+use Prometheus\CollectorRegistry;
+use Prometheus\Storage\APC;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -32,14 +34,18 @@ class PaymentController extends AbstractController
         ['code' => 'invalid_card', 'message' => 'Card number is invalid'],
     ];
 
+    private CollectorRegistry $metrics;
+
     public function __construct(
         private readonly HttpClientInterface $httpClient,
     ) {
+        $this->metrics = new CollectorRegistry(new APC());
     }
 
     #[Route('/payments', methods: ['POST'])]
     public function processPayment(Request $request): JsonResponse
     {
+        $startTime = microtime(true);
         $tracer = Globals::tracerProvider()->getTracer('payment-service');
 
         $data = json_decode($request->getContent(), true) ?: [];
@@ -53,6 +59,11 @@ class PaymentController extends AbstractController
         $method = self::PAYMENT_METHODS[array_rand(self::PAYMENT_METHODS)];
         $psp = self::PSP_ROUTING[$method] ?? 'pay.nl';
         $cardLast4 = (string) random_int(1000, 9999);
+
+        $this->metrics->getOrRegisterHistogram(
+            'payment', 'amount_euros', 'Payment amount distribution', ['method', 'currency'],
+            [10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+        )->observe($amount, [$method, $currency]);
 
         // External compliance / sanctions check
         $httpbinUrl = rtrim($_SERVER['HTTPBIN_URL'] ?? 'https://httpbin.org', '/');
@@ -123,7 +134,11 @@ class PaymentController extends AbstractController
             $fraudSpan->setAttribute('fraud.region', $region);
             $fraudSpan->setAttribute('fraud.model_version', 'v3.2.1');
 
-            // Higher risk scores take longer (more checks)
+            $this->metrics->getOrRegisterHistogram(
+                'payment', 'fraud_risk_score', 'Fraud risk score distribution', [],
+                [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            )->observe($riskScore, []);
+
             $fraudCheckTime = $riskScore > 60
                 ? random_int(40000, 100000)
                 : random_int(10000, 30000);
@@ -135,12 +150,14 @@ class PaymentController extends AbstractController
                 ]);
             }
 
-            // ~3% hard block by fraud system
             if ($riskScore > 90) {
                 $fraudSpan->setStatus(StatusCode::STATUS_ERROR, 'Blocked by fraud detection');
                 $fraudSpan->recordException(
                     new \RuntimeException("Transaction blocked: risk score {$riskScore} exceeds threshold 90")
                 );
+
+                $this->metrics->getOrRegisterCounter('payment', 'fraud_blocks_total', 'Transactions blocked by fraud detection', [])
+                    ->incBy(1, []);
 
                 $notificationUrl = rtrim($_SERVER['NOTIFICATION_SERVICE_URL'] ?? 'http://notification-service:8080', '/');
                 $this->httpClient->request('POST', $notificationUrl . '/notifications', [
@@ -153,6 +170,8 @@ class PaymentController extends AbstractController
                         'message' => "Suspicious transaction blocked for order {$orderId}.",
                     ],
                 ]);
+
+                $this->recordRequest('POST', '/payments', 403, microtime(true) - $startTime);
 
                 return $this->json([
                     'payment_id' => $paymentId,
@@ -181,15 +200,16 @@ class PaymentController extends AbstractController
                 $threeDsSpan->setAttribute('payment.3ds.required', true);
                 $threeDsSpan->setAttribute('payment.amount', $amount);
 
-                // 3DS is slower
                 usleep(random_int(50000, 150000));
 
-                // ~2% 3DS timeout
                 if (random_int(1, 100) <= 2) {
                     $threeDsSpan->setStatus(StatusCode::STATUS_ERROR, '3DS verification timed out');
                     $threeDsSpan->recordException(
                         new \RuntimeException('3D Secure verification timed out after 30s')
                     );
+
+                    $this->recordRequest('POST', '/payments', 504, microtime(true) - $startTime);
+
                     return $this->json([
                         'payment_id' => $paymentId,
                         'status' => 'failed',
@@ -223,7 +243,6 @@ class PaymentController extends AbstractController
             $authSpan->setAttribute('psp.environment', 'production');
             $authSpan->setAttribute('net.peer.name', "{$psp}-api.example.com");
 
-            // PSP response times vary by provider
             $pspLatency = match ($psp) {
                 'pay.nl' => random_int(20000, 60000),
                 'mollie' => random_int(30000, 90000),
@@ -232,7 +251,11 @@ class PaymentController extends AbstractController
             };
             usleep($pspLatency);
 
-            // ~3% PSP timeout
+            $this->metrics->getOrRegisterHistogram(
+                'payment', 'psp_latency_seconds', 'PSP authorization latency', ['psp'],
+                [0.02, 0.05, 0.1, 0.15, 0.2, 0.5]
+            )->observe($pspLatency / 1_000_000, [$psp]);
+
             if (random_int(1, 100) <= 3) {
                 $authSpan->setStatus(StatusCode::STATUS_ERROR, "PSP {$psp} request timed out");
                 $authSpan->recordException(
@@ -242,6 +265,9 @@ class PaymentController extends AbstractController
                     'psp' => $psp,
                     'timeout_ms' => 30000,
                 ]);
+
+                $this->recordRequest('POST', '/payments', 504, microtime(true) - $startTime);
+
                 return $this->json([
                     'payment_id' => $paymentId,
                     'status' => 'failed',
@@ -250,7 +276,6 @@ class PaymentController extends AbstractController
                 ], 504);
             }
 
-            // ~10% decline
             if (random_int(1, 100) <= 10) {
                 $decline = self::DECLINE_REASONS[array_rand(self::DECLINE_REASONS)];
                 $authSpan->setStatus(StatusCode::STATUS_ERROR, $decline['message']);
@@ -273,10 +298,12 @@ class PaymentController extends AbstractController
             $authSpan->end();
         }
 
-        // Check decline from attributes is unreliable, use a simpler approach
         $shouldFail = random_int(1, 100) <= 10;
         if ($shouldFail) {
             $decline = self::DECLINE_REASONS[array_rand(self::DECLINE_REASONS)];
+
+            $this->metrics->getOrRegisterCounter('payment', 'declined_total', 'Declined payments', ['method', 'psp', 'reason'])
+                ->incBy(1, [$method, $psp, $decline['code']]);
 
             $notificationUrl = rtrim($_SERVER['NOTIFICATION_SERVICE_URL'] ?? 'http://notification-service:8080', '/');
             $this->httpClient->request('POST', $notificationUrl . '/notifications', [
@@ -289,6 +316,8 @@ class PaymentController extends AbstractController
                     'message' => "Payment declined for order {$orderId}: {$decline['message']}",
                 ],
             ]);
+
+            $this->recordRequest('POST', '/payments', 422, microtime(true) - $startTime);
 
             return $this->json([
                 'payment_id' => $paymentId,
@@ -329,6 +358,10 @@ class PaymentController extends AbstractController
             $dbSpan->end();
         }
 
+        $this->metrics->getOrRegisterCounter('payment', 'successful_total', 'Successful payments', ['method', 'psp'])
+            ->incBy(1, [$method, $psp]);
+        $this->recordRequest('POST', '/payments', 200, microtime(true) - $startTime);
+
         return $this->json([
             'payment_id' => $paymentId,
             'status' => 'settled',
@@ -343,5 +376,17 @@ class PaymentController extends AbstractController
     public function health(): JsonResponse
     {
         return $this->json(['status' => 'healthy', 'service' => 'payment-service']);
+    }
+
+    private function recordRequest(string $method, string $endpoint, int $status, float $duration): void
+    {
+        $this->metrics->getOrRegisterCounter(
+            'payment', 'http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status']
+        )->incBy(1, [$method, $endpoint, (string) $status]);
+
+        $this->metrics->getOrRegisterHistogram(
+            'payment', 'http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint'],
+            [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        )->observe($duration, [$method, $endpoint]);
     }
 }

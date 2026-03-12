@@ -5,6 +5,8 @@ namespace App\Controller;
 use OpenTelemetry\API\Globals;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
+use Prometheus\CollectorRegistry;
+use Prometheus\Storage\APC;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -15,14 +17,18 @@ class OrderController extends AbstractController
 {
     private const OUT_OF_STOCK_SKUS = ['MK-300', 'WC-400'];
 
+    private CollectorRegistry $metrics;
+
     public function __construct(
         private readonly HttpClientInterface $httpClient,
     ) {
+        $this->metrics = new CollectorRegistry(new APC());
     }
 
     #[Route('/orders', methods: ['POST'])]
     public function createOrder(Request $request): JsonResponse
     {
+        $startTime = microtime(true);
         $tracer = Globals::tracerProvider()->getTracer('order-service');
 
         $data = json_decode($request->getContent(), true) ?: [];
@@ -33,6 +39,11 @@ class OrderController extends AbstractController
         $requestId = $data['request_id'] ?? 'unknown';
         $region = $data['region'] ?? 'eu-west';
         $priority = $data['priority'] ?? 'standard';
+
+        $this->metrics->getOrRegisterHistogram(
+            'order', 'order_value_euros', 'Order value distribution in EUR', [],
+            [10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+        )->observe($total, []);
 
         // Persist order to "database"
         $dbSpan = $tracer->spanBuilder('db.query INSERT orders')
@@ -46,7 +57,6 @@ class OrderController extends AbstractController
             $dbSpan->setAttribute('db.statement', 'INSERT INTO orders (id, customer_id, total, status, region, priority) VALUES ($1, $2, $3, $4, $5, $6)');
             $dbSpan->setAttribute('order.id', $orderId);
 
-            // ~5% chance of slow query
             $queryTime = random_int(1, 100) <= 5
                 ? random_int(200000, 500000)
                 : random_int(3000, 15000);
@@ -57,6 +67,8 @@ class OrderController extends AbstractController
                     'duration_ms' => round($queryTime / 1000, 1),
                     'threshold_ms' => 100,
                 ]);
+                $this->metrics->getOrRegisterCounter('order', 'db_slow_queries_total', 'Slow database queries', ['operation'])
+                    ->incBy(1, ['INSERT']);
             }
 
             $dbSpan->addEvent('db.query_completed', ['rows_affected' => 1]);
@@ -78,7 +90,6 @@ class OrderController extends AbstractController
                 $sku = $item['sku'] ?? 'unknown';
                 $qty = $item['quantity'] ?? 1;
 
-                // Simulated cache lookup for stock level
                 $cacheHit = random_int(1, 100) <= 70;
                 $stockCheckSpan = $tracer->spanBuilder('inventory.check_sku')->startSpan();
                 $stockCheckScope = $stockCheckSpan->activate();
@@ -87,11 +98,13 @@ class OrderController extends AbstractController
                     $stockCheckSpan->setAttribute('inventory.requested_qty', $qty);
                     $stockCheckSpan->setAttribute('cache.hit', $cacheHit);
 
+                    $this->metrics->getOrRegisterCounter('order', 'inventory_cache_lookups_total', 'Inventory cache lookups', ['result'])
+                        ->incBy(1, [$cacheHit ? 'hit' : 'miss']);
+
                     if ($cacheHit) {
                         usleep(random_int(500, 2000));
                         $stockCheckSpan->addEvent('inventory.cache_hit', ['sku' => $sku]);
                     } else {
-                        // Cache miss: query "database"
                         $stockDbSpan = $tracer->spanBuilder('db.query SELECT stock')
                             ->setSpanKind(SpanKind::KIND_CLIENT)
                             ->startSpan();
@@ -109,7 +122,6 @@ class OrderController extends AbstractController
                         $stockCheckSpan->addEvent('inventory.cache_miss', ['sku' => $sku]);
                     }
 
-                    // ~8% chance of out-of-stock on specific SKUs
                     if (in_array($sku, self::OUT_OF_STOCK_SKUS) && random_int(1, 100) <= 8) {
                         $outOfStock = true;
                         $outOfStockItem = $sku;
@@ -131,6 +143,10 @@ class OrderController extends AbstractController
                 $inventorySpan->recordException(
                     new \RuntimeException("Insufficient stock for SKU {$outOfStockItem}")
                 );
+
+                $this->metrics->getOrRegisterCounter('order', 'inventory_out_of_stock_total', 'Out of stock events', ['sku'])
+                    ->incBy(1, [$outOfStockItem]);
+                $this->recordRequest('POST', '/orders', 409, microtime(true) - $startTime);
 
                 return $this->json([
                     'order_id' => $orderId,
@@ -202,7 +218,6 @@ class OrderController extends AbstractController
         $paymentResult = $paymentResponse->toArray(false);
 
         if ($paymentResponse->getStatusCode() >= 400) {
-            // Rollback inventory reservation
             $rollbackSpan = $tracer->spanBuilder('inventory.rollback')->startSpan();
             $rollbackScope = $rollbackSpan->activate();
             try {
@@ -214,6 +229,8 @@ class OrderController extends AbstractController
                 $rollbackScope->detach();
                 $rollbackSpan->end();
             }
+
+            $this->recordRequest('POST', '/orders', 422, microtime(true) - $startTime);
 
             return $this->json([
                 'order_id' => $orderId,
@@ -254,6 +271,10 @@ class OrderController extends AbstractController
             ]);
         }
 
+        $this->metrics->getOrRegisterCounter('order', 'orders_created_total', 'Successfully created orders', ['priority', 'region'])
+            ->incBy(1, [$priority, $region]);
+        $this->recordRequest('POST', '/orders', 200, microtime(true) - $startTime);
+
         return $this->json([
             'order_id' => $orderId,
             'status' => 'confirmed',
@@ -268,6 +289,7 @@ class OrderController extends AbstractController
     #[Route('/orders/{orderId}', methods: ['GET'])]
     public function getOrder(string $orderId): JsonResponse
     {
+        $startTime = microtime(true);
         $tracer = Globals::tracerProvider()->getTracer('order-service');
 
         $dbSpan = $tracer->spanBuilder('db.query SELECT orders')
@@ -282,10 +304,12 @@ class OrderController extends AbstractController
             $dbSpan->setAttribute('order.id', $orderId);
             usleep(random_int(3000, 15000));
 
-            // ~10% chance order not found
             if (random_int(1, 100) <= 10) {
                 $dbSpan->addEvent('db.query_completed', ['rows_returned' => 0]);
                 $dbSpan->setStatus(StatusCode::STATUS_ERROR, 'Order not found');
+
+                $this->recordRequest('GET', '/orders/{id}', 404, microtime(true) - $startTime);
+
                 return $this->json([
                     'error' => 'not_found',
                     'order_id' => $orderId,
@@ -297,6 +321,8 @@ class OrderController extends AbstractController
             $dbScope->detach();
             $dbSpan->end();
         }
+
+        $this->recordRequest('GET', '/orders/{id}', 200, microtime(true) - $startTime);
 
         return $this->json([
             'order_id' => $orderId,
@@ -311,5 +337,17 @@ class OrderController extends AbstractController
     public function health(): JsonResponse
     {
         return $this->json(['status' => 'healthy', 'service' => 'order-service']);
+    }
+
+    private function recordRequest(string $method, string $endpoint, int $status, float $duration): void
+    {
+        $this->metrics->getOrRegisterCounter(
+            'order', 'http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status']
+        )->incBy(1, [$method, $endpoint, (string) $status]);
+
+        $this->metrics->getOrRegisterHistogram(
+            'order', 'http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint'],
+            [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        )->observe($duration, [$method, $endpoint]);
     }
 }

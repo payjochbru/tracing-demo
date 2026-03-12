@@ -1,7 +1,7 @@
 FROM php:8.3-cli-alpine
 
 ADD --chmod=755 https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions /usr/local/bin/
-RUN install-php-extensions opentelemetry protobuf
+RUN install-php-extensions opentelemetry protobuf apcu
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
@@ -12,6 +12,8 @@ RUN composer install --no-dev --no-scripts --no-autoloader
 
 COPY . .
 RUN composer dump-autoload --optimize --classmap-authoritative
+
+RUN echo "apc.enable_cli=1" > /usr/local/etc/php/conf.d/apcu-cli.ini
 
 ENV OTEL_PHP_AUTOLOAD_ENABLED=true \
     OTEL_TRACES_EXPORTER=otlp \

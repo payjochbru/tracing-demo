@@ -5,6 +5,8 @@ namespace App\Controller;
 use OpenTelemetry\API\Globals;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
+use Prometheus\CollectorRegistry;
+use Prometheus\Storage\APC;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -26,14 +28,18 @@ class CheckoutController extends AbstractController
 
     private const REGIONS = ['eu-west', 'eu-central', 'us-east', 'ap-southeast'];
 
+    private CollectorRegistry $metrics;
+
     public function __construct(
         private readonly HttpClientInterface $httpClient,
     ) {
+        $this->metrics = new CollectorRegistry(new APC());
     }
 
     #[Route('/checkout', methods: ['POST'])]
     public function checkout(Request $request): JsonResponse
     {
+        $startTime = microtime(true);
         $tracer = Globals::tracerProvider()->getTracer('gateway');
         $requestId = 'req_' . bin2hex(random_bytes(8));
         $region = self::REGIONS[array_rand(self::REGIONS)];
@@ -43,6 +49,9 @@ class CheckoutController extends AbstractController
         $items = $data['items'] ?? $this->generateRandomItems();
         $total = array_sum(array_column($items, 'total'));
         $priority = $data['priority'] ?? (random_int(1, 10) === 1 ? 'express' : 'standard');
+
+        $this->metrics->getOrRegisterGauge('gateway', 'cart_value_euros', 'Cart value in EUR', ['region'])
+            ->set($total, [$region]);
 
         // Rate limiting check (~3% of requests)
         if (random_int(1, 100) <= 3) {
@@ -59,6 +68,10 @@ class CheckoutController extends AbstractController
                 $scope->detach();
                 $span->end();
             }
+
+            $this->recordRequest('POST', '/checkout', 429, microtime(true) - $startTime);
+            $this->metrics->getOrRegisterCounter('gateway', 'rate_limited_total', 'Rate limited requests', ['region'])
+                ->incBy(1, [$region]);
 
             return $this->json([
                 'error' => 'rate_limit_exceeded',
@@ -84,6 +97,9 @@ class CheckoutController extends AbstractController
             if (empty($items)) {
                 $validateSpan->setStatus(StatusCode::STATUS_ERROR, 'Empty cart');
                 $validateSpan->recordException(new \InvalidArgumentException('Cannot checkout with an empty cart'));
+
+                $this->recordRequest('POST', '/checkout', 400, microtime(true) - $startTime);
+
                 return $this->json([
                     'error' => 'validation_failed',
                     'message' => 'Cart is empty',
@@ -159,18 +175,24 @@ class CheckoutController extends AbstractController
 
         $result = $response->toArray(false);
         $statusCode = $response->getStatusCode();
+        $finalStatus = $statusCode >= 400 ? 502 : 200;
+
+        $this->recordRequest('POST', '/checkout', $finalStatus, microtime(true) - $startTime);
+        $this->metrics->getOrRegisterCounter('gateway', 'checkout_total', 'Total checkout attempts', ['priority', 'region'])
+            ->incBy(1, [$priority, $region]);
 
         return $this->json([
             'status' => $statusCode >= 400 ? 'failed' : 'accepted',
             'request_id' => $requestId,
             'customer_id' => $customerId,
             'order' => $result,
-        ], $statusCode >= 400 ? 502 : 200);
+        ], $finalStatus);
     }
 
     #[Route('/orders/{orderId}', methods: ['GET'])]
     public function getOrder(string $orderId): JsonResponse
     {
+        $startTime = microtime(true);
         $tracer = Globals::tracerProvider()->getTracer('gateway');
 
         $span = $tracer->spanBuilder('gateway.lookup_order')->startSpan();
@@ -186,9 +208,12 @@ class CheckoutController extends AbstractController
         $orderServiceUrl = rtrim($_SERVER['ORDER_SERVICE_URL'] ?? 'http://order-service:8080', '/');
         $response = $this->httpClient->request('GET', $orderServiceUrl . '/orders/' . $orderId);
 
+        $statusCode = $response->getStatusCode();
+        $this->recordRequest('GET', '/orders/{id}', $statusCode, microtime(true) - $startTime);
+
         return $this->json(
             $response->toArray(false),
-            $response->getStatusCode(),
+            $statusCode,
         );
     }
 
@@ -196,6 +221,18 @@ class CheckoutController extends AbstractController
     public function health(): JsonResponse
     {
         return $this->json(['status' => 'healthy', 'service' => 'gateway']);
+    }
+
+    private function recordRequest(string $method, string $endpoint, int $status, float $duration): void
+    {
+        $this->metrics->getOrRegisterCounter(
+            'gateway', 'http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status']
+        )->incBy(1, [$method, $endpoint, (string) $status]);
+
+        $this->metrics->getOrRegisterHistogram(
+            'gateway', 'http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint'],
+            [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        )->observe($duration, [$method, $endpoint]);
     }
 
     private function generateRandomItems(): array

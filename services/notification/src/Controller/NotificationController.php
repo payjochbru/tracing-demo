@@ -5,6 +5,8 @@ namespace App\Controller;
 use OpenTelemetry\API\Globals;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
+use Prometheus\CollectorRegistry;
+use Prometheus\Storage\APC;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -15,9 +17,17 @@ class NotificationController extends AbstractController
     private const EMAIL_PROVIDERS = ['sendgrid', 'ses'];
     private const SMS_PROVIDERS = ['twilio', 'messagebird'];
 
+    private CollectorRegistry $metrics;
+
+    public function __construct()
+    {
+        $this->metrics = new CollectorRegistry(new APC());
+    }
+
     #[Route('/notifications', methods: ['POST'])]
     public function send(Request $request): JsonResponse
     {
+        $startTime = microtime(true);
         $tracer = Globals::tracerProvider()->getTracer('notification-service');
 
         $data = json_decode($request->getContent(), true) ?: [];
@@ -44,7 +54,6 @@ class NotificationController extends AbstractController
             $templateSpan->setAttribute('notification.priority', $priority);
             $templateSpan->setAttribute('notification.channel', $channel);
 
-            // Complex templates take longer
             $renderTime = match ($type) {
                 'order_confirmation' => random_int(5000, 15000),
                 'fraud_alert' => random_int(2000, 5000),
@@ -103,7 +112,11 @@ class NotificationController extends AbstractController
             };
             usleep($deliveryTimeUs);
 
-            // ~8% chance primary provider fails
+            $this->metrics->getOrRegisterHistogram(
+                'notification', 'delivery_duration_seconds', 'Notification delivery duration', ['channel', 'provider'],
+                [0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
+            )->observe($deliveryTimeUs / 1_000_000, [$channel, $primaryProvider]);
+
             if (random_int(1, 100) <= 8) {
                 $deliveryFailed = true;
                 $errorMsg = match (random_int(1, 3)) {
@@ -118,6 +131,9 @@ class NotificationController extends AbstractController
                     'will_retry' => true,
                     'fallback_provider' => $fallbackProvider,
                 ]);
+
+                $this->metrics->getOrRegisterCounter('notification', 'provider_errors_total', 'Provider delivery errors', ['channel', 'provider'])
+                    ->incBy(1, [$channel, $primaryProvider]);
             } else {
                 $deliverSpan->addEvent('notification.sent', [
                     'provider_message_id' => $primaryProvider . '_' . bin2hex(random_bytes(6)),
@@ -131,6 +147,9 @@ class NotificationController extends AbstractController
 
         // Fallback to secondary provider if primary failed
         if ($deliveryFailed) {
+            $this->metrics->getOrRegisterCounter('notification', 'provider_failovers_total', 'Provider failover events', ['channel'])
+                ->incBy(1, [$channel]);
+
             $retrySpan = $tracer->spanBuilder("notification.deliver ({$fallbackProvider})")
                 ->setSpanKind(SpanKind::KIND_CLIENT)
                 ->startSpan();
@@ -145,12 +164,16 @@ class NotificationController extends AbstractController
 
                 usleep(random_int(15000, 50000));
 
-                // ~2% chance fallback also fails
                 if (random_int(1, 100) <= 2) {
                     $retrySpan->setStatus(StatusCode::STATUS_ERROR, 'All providers failed');
                     $retrySpan->recordException(
                         new \RuntimeException("Fallback provider {$fallbackProvider} also failed")
                     );
+
+                    $this->recordRequest('POST', '/notifications', 502, microtime(true) - $startTime);
+                    $this->metrics->getOrRegisterCounter('notification', 'total_failures', 'Complete delivery failures', ['channel'])
+                        ->incBy(1, [$channel]);
+
                     return $this->json([
                         'notification_id' => $notificationId,
                         'status' => 'failed',
@@ -169,6 +192,10 @@ class NotificationController extends AbstractController
             }
         }
 
+        $this->metrics->getOrRegisterCounter('notification', 'sent_total', 'Successfully sent notifications', ['type', 'channel', 'provider'])
+            ->incBy(1, [$type, $channel, $deliveryFailed ? $fallbackProvider : $primaryProvider]);
+        $this->recordRequest('POST', '/notifications', 200, microtime(true) - $startTime);
+
         return $this->json([
             'notification_id' => $notificationId,
             'status' => 'delivered',
@@ -182,5 +209,17 @@ class NotificationController extends AbstractController
     public function health(): JsonResponse
     {
         return $this->json(['status' => 'healthy', 'service' => 'notification-service']);
+    }
+
+    private function recordRequest(string $method, string $endpoint, int $status, float $duration): void
+    {
+        $this->metrics->getOrRegisterCounter(
+            'notification', 'http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status']
+        )->incBy(1, [$method, $endpoint, (string) $status]);
+
+        $this->metrics->getOrRegisterHistogram(
+            'notification', 'http_request_duration_seconds', 'HTTP request duration', ['method', 'endpoint'],
+            [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        )->observe($duration, [$method, $endpoint]);
     }
 }

@@ -141,6 +141,110 @@ The traffic generator sends a mix of request types to produce varied traces:
 | Empty cart | 5% | Validation error at the gateway -- very short trace with error span |
 | Burst traffic | 20% | 1-2 rapid follow-up requests after the main one |
 
+## Prometheus Metrics
+
+Every service exposes a `/metrics` endpoint in Prometheus text format. A Prometheus instance configured to scrape pods with the standard `prometheus.io/*` annotations will pick these up automatically.
+
+### Per-Service Application Metrics
+
+Each service tracks custom business metrics using `promphp/prometheus_client_php` with APCu shared memory storage.
+
+**Gateway**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `gateway_http_requests_total` | counter | method, endpoint, status | Total HTTP requests handled |
+| `gateway_http_request_duration_seconds` | histogram | method, endpoint | Request latency distribution |
+| `gateway_checkout_total` | counter | priority, region | Checkout attempts |
+| `gateway_rate_limited_total` | counter | region | Rate-limited requests |
+| `gateway_cart_value_euros` | gauge | region | Last seen cart value |
+
+**Order Service**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `order_http_requests_total` | counter | method, endpoint, status | Total HTTP requests handled |
+| `order_http_request_duration_seconds` | histogram | method, endpoint | Request latency distribution |
+| `order_orders_created_total` | counter | priority, region | Successfully created orders |
+| `order_order_value_euros` | histogram | | Order value distribution |
+| `order_inventory_cache_lookups_total` | counter | result | Cache hit/miss ratio for inventory checks |
+| `order_inventory_out_of_stock_total` | counter | sku | Out-of-stock events by SKU |
+| `order_db_slow_queries_total` | counter | operation | Slow database queries |
+
+**Payment Service**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `payment_http_requests_total` | counter | method, endpoint, status | Total HTTP requests handled |
+| `payment_http_request_duration_seconds` | histogram | method, endpoint | Request latency distribution |
+| `payment_successful_total` | counter | method, psp | Successful payments by method and PSP |
+| `payment_declined_total` | counter | method, psp, reason | Declined payments with decline reason |
+| `payment_fraud_blocks_total` | counter | | Transactions blocked by fraud detection |
+| `payment_fraud_risk_score` | histogram | | Fraud risk score distribution |
+| `payment_amount_euros` | histogram | method, currency | Payment amount distribution |
+| `payment_psp_latency_seconds` | histogram | psp | PSP authorization latency per provider |
+
+**Notification Service**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `notification_http_requests_total` | counter | method, endpoint, status | Total HTTP requests handled |
+| `notification_http_request_duration_seconds` | histogram | method, endpoint | Request latency distribution |
+| `notification_sent_total` | counter | type, channel, provider | Successfully sent notifications |
+| `notification_provider_errors_total` | counter | channel, provider | Provider delivery failures |
+| `notification_provider_failovers_total` | counter | channel | Failover events from primary to fallback provider |
+| `notification_total_failures` | counter | channel | Complete delivery failures (both providers down) |
+| `notification_delivery_duration_seconds` | histogram | channel, provider | Delivery latency per channel and provider |
+
+### OTel Collector Span Metrics (RED)
+
+The OpenTelemetry Collector uses the `spanmetrics` connector to automatically derive Rate, Error, and Duration (RED) metrics from every trace span. These are exposed on `otel-collector:9090/metrics` in Prometheus format.
+
+Generated metrics include:
+
+- `calls_total{service_name, span_name, status_code}` -- request rate per span
+- `duration_milliseconds_bucket{service_name, span_name}` -- latency histograms per span
+
+These require zero code changes -- they are computed from trace data. This is a powerful way to demonstrate how traces and metrics connect: every span you see in Tempo also has corresponding rate/error/duration metrics available in Prometheus.
+
+### Scrape Configuration
+
+All pods carry standard Prometheus annotations:
+
+```yaml
+annotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"    # 9090 for the OTel Collector
+  prometheus.io/path: "/metrics"
+```
+
+If your Prometheus uses the Kubernetes SD config with `relabel_configs` that honour these annotations, scraping works out of the box.
+
+### Example PromQL Queries
+
+```promql
+# Checkout request rate (per second, 5m window)
+rate(gateway_http_requests_total{endpoint="/checkout"}[5m])
+
+# Payment success rate
+sum(rate(payment_successful_total[5m])) / sum(rate(payment_http_requests_total{endpoint="/payments"}[5m]))
+
+# P99 latency per service
+histogram_quantile(0.99, sum(rate(gateway_http_request_duration_seconds_bucket[5m])) by (le))
+
+# Inventory cache hit ratio
+sum(rate(order_inventory_cache_lookups_total{result="hit"}[5m])) / sum(rate(order_inventory_cache_lookups_total[5m]))
+
+# PSP latency comparison (P95)
+histogram_quantile(0.95, sum(rate(payment_psp_latency_seconds_bucket[5m])) by (le, psp))
+
+# Notification provider failover rate
+rate(notification_provider_failovers_total[5m])
+
+# Span-derived: request rate per service (from OTel Collector)
+sum(rate(calls_total[5m])) by (service_name)
+```
+
 ## Prerequisites
 
 - Docker
